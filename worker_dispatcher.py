@@ -25,7 +25,7 @@ def get_runtime_env(mode: str):
     if mode == "generation":
         runtime_env["pip"] = [
             f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}",   
-            "math-verify[antlr4_13_2]"
+            # "math-verify[antlr4_13_2]"
         ]
         runtime_env["excludes"] = ["*.pyc", "__pycache__"]
     elif mode == "logprob":
