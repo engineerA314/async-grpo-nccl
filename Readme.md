@@ -117,11 +117,19 @@ done
 
 In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for logprob. you must wait until all the workers are started before starting the training, which is shown by `worker <ID> registered` for each worker. Adjust the number of verifiers, each uses one CPU, make sure your cluster has the capacity.
 
+### Prepare trainer env
+
+```bash
+conda create grpo_trainer python=3.12 -y; conda activate grpo_trainer; pip install -r requirements_base.txt;pip install -r requirements_fsdp.txt
+```
+
 ### Prepare the dataset
 this is custom for the task you're training on. In our case, we used the [Countdown-Tasks-3to4](https://huggingface.co/datasets/Jiayi-Pan/Countdown-Tasks-3to4) dataset. Which we process doing the following:
 
 ```bash
-python sample-data/create_count_down.py
+cd sample-data
+python create_count_down.py
+cd ../
 ```
 
 this will create a file called `count_down_tasks_3to4.jsonl` in the `sample-data` directory.
@@ -129,10 +137,6 @@ this will create a file called `count_down_tasks_3to4.jsonl` in the `sample-data
 ### Start the training on the nodes you want to use for training
 
 Finally, the last step is to launch the training on the remaining GPUs. In this example case, we trained with 8 GPUs on a single training node.
-
-```bash
-conda create grpo python=3.12 -y; conda activate grpo; pip install -r requirements_base.txt;pip install -r requirements_fsdp.txt
-```
 
 For example, in our recent DeepScaleR reproduction, we used:
 ```bash
