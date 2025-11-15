@@ -1,6 +1,6 @@
-torch<2.7
-torchvision
-transformers #==4.48.3
+torch==2.6.0
+torchvision==0.21.0
+transformers<=4.54.0
 datasets
 accelerate #==1.3
 ray[default]==2.47.1
@@ -9,10 +9,12 @@ ipython
 nest_asyncio
 numba
 rich
-flash-attn ==v2.7.2.post1
+flash-attn==2.7.4.post1
 msgspec
 cloudpickle
 pyzmq
 blake3
 py-cpuinfo
 openai
+protobuf==4.25.3
+pydantic~=2.5.3

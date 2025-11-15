@@ -11,13 +11,15 @@ from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
 import torch.nn.functional as F
 
+try:
+    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _fa_cross_entropy_loss
+    _FLASH_ATTN_CE_AVAILABLE = True
+except Exception:
+    _FLASH_ATTN_CE_AVAILABLE = False
+
 DEBUG = False
 def debug_print(message):
-    if DEBUG:
-        rank = torch.distributed.get_rank()
-        with open(f"debug_grpo_loss_{rank}.log", "a") as f:
-            f.write(message + "\n")
-        print(message)
+    return
 
 @dataclass
 class GRPOOutput(ModelOutput):
@@ -27,6 +29,7 @@ class GRPOOutput(ModelOutput):
     loss_clip1: torch.Tensor = None
     loss_unclipped: torch.Tensor = None
     loss_clipped: torch.Tensor = None
+    policy_logprobs: torch.Tensor = None
 
 @dataclass
 class LogProbsOutput(ModelOutput):
@@ -34,7 +37,15 @@ class LogProbsOutput(ModelOutput):
     entropy: torch.Tensor = None
 
 
-def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', use_torch_compile: bool = True):
+def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', use_torch_compile: bool = True, loss_chunksize: int | None = None):
+    # Compile only lightweight helper(s), not the full loss graph
+    global COMPUTE_ENTROPY_FN
+    COMPUTE_ENTROPY_FN = entropy_from_logits
+    if use_torch_compile:
+        try:
+            COMPUTE_ENTROPY_FN = torch.compile(entropy_from_logits, mode="reduce-overhead")
+        except Exception:
+            COMPUTE_ENTROPY_FN = entropy_from_logits
     def _forward(
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -53,6 +64,7 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         clip_low: float = 0.2,
         clip_high: float = 0.4,
         clip_ratio_c: float = 1e32,
+        compute_entropy: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else model.config.output_attentions
@@ -61,8 +73,6 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         )
         return_dict = return_dict if return_dict is not None else model.config.use_return_dict
         
-        if DEBUG:
-            debug_print(f"\033[1;38;2;255;165;0m _forward line 36: \033[0m input_ids.shape: {input_ids.shape}")
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = model.model(
             input_ids=input_ids,
@@ -79,36 +89,11 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         )
         hidden_states = outputs[0]
 
-        if DEBUG:
-            debug_print(f"\033[1;38;2;255;165;0m _forward line 53: \033[0m hidden_states.shape: {hidden_states.shape}")
-
-        # T = hidden_states.shape[1]
-
-        # if loss_chunksize is None or labels is None:
-        #     loss_chunksize = 2**31 - 1  # max value for Python's int
-        
-        # loss_chunksize = min(loss_chunksize, T)
-
-        # shift labels by one to the left so input_ids[0] predicts labels[1] and pad with -100 on the right since the last input_id doesn't correspond to any label.
-        # shifted_labels = nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
-        # total_loss = []
-        # entropy_list = []
-
-        # for i in range(0, T, loss_chunksize):
-        #     end_idx = min(i + loss_chunksize, T)
-        #     logits = model.lm_head(hidden_states[:, i:end_idx, :]).float().div_(temperature)
-        #     loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
-        #     total_loss.append(loss)
-        #     entropy_list.append(entropy_from_logits(logits.detach().bfloat16()))
-        # total_loss = torch.cat(total_loss, dim=0)
-        # debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m max total_loss: {max(torch.abs(total_loss.detach()))}")
-        # debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m mean total_loss: {total_loss.detach().mean()}")
-
         if mode == 'training':
-            # select the GRPO loss function, compile if requested, without shadowing the global
+            # Use memory-efficient per-token logprob computation; avoid compiling heavy graphs
             loss_fn = grpo_loss_and_entropy_ce_from_logsoftmax
-            if use_torch_compile:
-                loss_fn = torch.compile(loss_fn)
+            compiled_per_token_fn = None  # intentionally not compiled
+            _true_logprobs = None
             
             out = loss_fn(
                 lm_head_weights=model.lm_head.weight,
@@ -121,6 +106,8 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
                 clip_low=clip_low,
                 clip_high=clip_high,
                 clip_ratio_c=clip_ratio_c,
+                loss_chunksize=loss_chunksize,
+                per_token_fn=compiled_per_token_fn if compiled_per_token_fn is not None else logprobs_from_logits,
             )
             return GRPOOutput(
                 loss=out[0],
@@ -129,12 +116,11 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
                 loss_clip1=out[3],
                 loss_unclipped=out[4],
                 loss_clipped=out[5],
+                policy_logprobs=_true_logprobs,
             )
         elif mode == 'eval':
-            # select the eval log-prob function, compile if requested
+            # select the eval log-prob function; keep eager for stability
             loss_fn = ce_loss_and_entropy_logsoftmax
-            if use_torch_compile:
-                loss_fn = torch.compile(loss_fn)
             
             out = loss_fn(
                 lm_head_weights=model.lm_head.weight,
@@ -157,197 +143,65 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
     model.forward = _forward
     return model
 
-# see transformers/loss/loss_utils.py:ForCausalLMLoss
-# coming from the fact that logprobs equivalent to -CrossEntropyLoss(logits, labels)
-# this is a modification that does exactly the same except that there's no reduction
-# and we return the per-token log probabilities as -CrossEntropyLoss(logits, labels)
-# @torch.compile
-# def PerTokenLogProbsFromCE(
-#     logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
-# ):
-#     """
-#     Compute per-token log probabilities from a cross-entropy loss.
-#     returns a tensor of shape (L,) where L is the total number of tokens in the batch.
-#     the logprob i corresponds to the token at position i+1 in the input_ids.
-#     the logprob at position -1 is 0, as well as the logprob at position len(sample)-1 of each sample.
-#     """
-#     # Upcast to float if we need to compute the loss to avoid potential precision issues
-#     logits = logits.float()
-#     labels = labels.to(logits.device)
-#     # Shift so that tokens < n predict n
-#     # labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
-#     # shift_labels = labels[..., 1:].contiguous()
-
-#     # Flatten the tokens
-#     logits = logits.view(-1, vocab_size)
-    
-#     labels = labels.view(-1)
-#     # Enable model parallelism
-#     labels = labels.to(logits.device)
-#     per_token_ce = nn.functional.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
-#     logprobs = -per_token_ce
-#     return logprobs, logits
-
-# def get_per_token_logps(model, batched_samples_ids, batched_samples_position_ids, batched_samples_output_indices):
-#     """
-#     Given logits and target token IDs, compute per-token log probabilities
-#     using torch.nn.functional.cross_entropy with reduction='none'.
-
-#     Args:
-#         logits (torch.Tensor): Tensor of shape [B, L, V] (B=batch size, L=sequence length, V=vocab size).
-#         target (torch.Tensor): Tensor of shape [B, L] containing target token IDs.
-#         ignore_index (int): The index that should be ignored in the loss computation.
-
-#     Returns:
-#         torch.Tensor: Per-token log probabilities of shape [B, L].
-#     """
-#     # Assume tokens to predict are shifted by one:
-#     #   logits: prediction for t+1 tokens -> remove last time step
-#     shift_logits = logits[:, :-1, :]             # shape: [B, L-1, V]
-#     shift_target = target[:, 1:].contiguous()      # shape: [B, L-1]
-
-#     # Flatten for cross entropy computation.
-#     flat_logits = shift_logits.reshape(-1, shift_logits.size(-1))
-#     flat_target = shift_target.reshape(-1)
-
-#     # Compute element-wise cross entropy loss (-log probability).
-#     losses = F.cross_entropy(
-#         flat_logits, flat_target, reduction="none", ignore_index=ignore_index
-#     )  # shape: [B*(L-1)]
-
-#     # Reshape back to [B, L-1]
-#     losses = losses.view(shift_target.size())
-
-#     # The log probabilities are the negatives of the loss values.
-#     logprobs = -losses
-#     return logprobs
-
-#     # ALDO: batched_samples_output_indices index the logits
-#     # but the logits correspond to the next token probabilities (logit i is the logit for token i+1)
-#     # therefore we need to index the output_ids of the indices + 1
-#     output_ids = batched_samples_ids[:, batched_samples_output_indices+1].contiguous().to(logits.device)
-#     token_logits = logits.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1).contiguous()
-#     # Compute logsumexp for normalization over the vocab dimension: shape [1, N]
-#     # do a for loop to reduce memory peak
-#     logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits]).contiguous()
-#     # Final log probability per token: shape [1, N]
-#     output_log_probs = token_logits - logsumexp_values
-#     return output_log_probs
-
-# def compute_kl_divergence(
-#     policy_logprobs: torch.Tensor,
-#     reference_logprobs: torch.Tensor
-# ) -> torch.Tensor:
-#     """
-#     Compute KL divergence between policy and reference model using the Schulman approximation.
-#     KL ≈ π_ref/π_θ - log(π_ref/π_θ) - 1
-#     """
-#     ratio = torch.exp(reference_logprobs - policy_logprobs)
-#     kl_div = ratio - (reference_logprobs - policy_logprobs) - 1
-#     return kl_div
-
-# # def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
-# #     """
-# #     loss is a tensor of shape [1, N] where N is the total number of tokens across all samples.
-# #     output_lens_broadcasted has the length
-# #     """
-# #     return (loss/output_lens_broadcasted).sum()/num_samples
-
-# # @torch.compile
-# def entropy_from_logits(logits: torch.Tensor):
-#     """Calculate entropy from logits."""
-#     with torch.no_grad():
-#         pd = torch.nn.functional.softmax(logits, dim=-1)
-#         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
-#     return entropy
-
-# # @torch.compile
-# def policy_loss(
-#     policy_logprobs: torch.Tensor,
-#     old_logprobs: torch.Tensor,
-#     advantages: torch.Tensor,
-#     output_indices: torch.Tensor,
-#     clip_low: float,
-#     clip_high: float,
-#     clip_ratio_c: float,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-#     negative_approx_kl = policy_logprobs - old_logprobs
-#     ratio = torch.exp(negative_approx_kl)
-#     # ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-#     pg_losses1 = -advantages * ratio
-#     pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-#     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-#     # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-
-#     pg_losses3 = -advantages * clip_ratio_c
-#     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-#     # pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
-
-#     pg_loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1).sum()
-#     # pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-#     # return pg_loss, negative_approx_kl, clip_pg_losses1, pg_losses1, 
-
-#     ##########
-#     neg_log_ratio = policy_logprobs - old_logprobs
-#     ratio = torch.exp(neg_log_ratio)
-
-#     # 2) Determine clipping bounds
-#     lower = 1.0 - clip_low
-#     upper = 1.0 + clip_high
-
-#     # 3) Compute per-token surrogate losses
-#     loss_unclipped = -advantages * ratio
-#     loss_clipped = -advantages * torch.clamp(ratio, lower, upper)
-#     loss_clipped_dual = -advantages * clip_ratio_c
-
-#     # 4) Standard PPO clipping: max(unclipped, clipped)
-#     loss_clip1 = torch.maximum(loss_unclipped, loss_clipped)
-
-#     # 5) Dual-clip step for negative advantages: cap at clip_ratio_c
-#     is_negative = advantages < 0
-#     loss_clip2 = torch.minimum(loss_clip1, loss_clipped_dual)
-
-#     # Final per-token loss selection
-#     pg_loss = torch.where(is_negative, loss_clip2, loss_clip1).sum()
-#     return pg_loss, neg_log_ratio, loss_clip1, loss_unclipped, loss_clipped, loss_clipped_dual, is_negative
-
-def per_token_log_probs_from_log_softmax(
+def logprobs_from_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    vocab_size: int,
     ignore_index: int = -100,
-    **kwargs,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    **unused_kwargs,
+) -> torch.Tensor:
     """
-    Compute per-token log probabilities (no reduction) via log_softmax + gather.
-    Returns (logprobs, logits_flat) where logprobs: [B*Lc] and logits_flat: [B*Lc, V].
+    Memory-efficient per-token log-prob computation (works with any dtype, does not create N*V log_softmax).
+    Prefer using Flash-Attn CE if available; otherwise, use gather - logsumexp method.
+    Returns shape: same as labels (BxL or 1xT)
     """
-    # Upcast to float and move labels to correct device
-    logits = logits.float()
+    if _FLASH_ATTN_CE_AVAILABLE:
+        return logprobs_from_logits_flash_attn(logits, labels, ignore_index=ignore_index)
+
+    # Safe labels (ignore_index -> 0)
+    safe_labels = labels.clone()
+    if ignore_index is not None:
+        safe_labels[safe_labels == ignore_index] = 0
+
+    # Gather logits at label positions and subtract logsumexp to compute log-prob
+    gathered = torch.gather(logits, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    lse = torch.logsumexp(logits, dim=-1)
+    logprobs = gathered - lse
+
+    if ignore_index is not None:
+        mask = (labels != ignore_index)
+        logprobs = logprobs * mask
+    return logprobs
+
+def logprobs_from_logits_flash_attn(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    inplace_backward: bool = True,
+    **unused_kwargs,
+) -> torch.Tensor:
+    """
+    Flash-Attn cross-entropy based per-token log-prob computation.
+    - logits: [..., V], labels: same shape prefix
+    - Returns: log-prob of same shape as labels
+    """
+    if not _FLASH_ATTN_CE_AVAILABLE:
+        raise RuntimeError("Flash-Attn cross_entropy_loss is not available")
     labels = labels.to(logits.device)
-
-    # Flatten tokens
-    logits_flat = logits.view(-1, vocab_size)
-    labels_flat = labels.contiguous().view(-1)
-
-    # Safe label indices for ignore positions
-    safe_labels = labels_flat.clone()
-    safe_labels[safe_labels == ignore_index] = 0
-
-    # Compute log-probabilities
-    logp_flat = F.log_softmax(logits_flat, dim=-1)
-
-    # Gather log-probabilities of the true labels
-    logprobs = logp_flat.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
-
-    # Zero out ignored positions
-    logprobs = logprobs * (labels_flat != ignore_index)
-    return logprobs, logits_flat
+    safe_labels = labels.clone()
+    if ignore_index is not None:
+        safe_labels[safe_labels == ignore_index] = 0
+    last_dim = logits.shape[-1]
+    flat_logits = logits.reshape(-1, last_dim)
+    flat_labels = safe_labels.reshape(-1)
+    losses, _ = _fa_cross_entropy_loss(flat_logits, flat_labels, inplace_backward=inplace_backward)
+    logprobs = -losses.view_as(safe_labels)
+    if ignore_index is not None:
+        mask = (labels != ignore_index)
+        logprobs = logprobs * mask
+    return logprobs
 
 def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Calculate entropy for each row of logits: H(p) = logsumexp - sum(p*logits)."""
+    """Calculate entropy for each row of logits: H(p) = logsumexp - sum(p*logits)"""
     with torch.no_grad():
         pd = F.softmax(logits, dim=-1)
         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
@@ -360,26 +214,43 @@ def fused_log_probs_and_entropy_fn(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
     temperature: float = 1.0,
-    per_token_fn: Callable = per_token_log_probs_from_log_softmax,
+    per_token_fn: Callable = logprobs_from_logits,
     **unused_kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generic GRPO loss/entropy that uses a per-token logprobs function.
     """
-    assert labels.shape[0] == 1, "ce_loss_and_entropy only supports batch size 1 but packed"
+    # Support both 1xT (packed) and BxL (padded) batches
     shifted_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
     V = lm_head_weights.size(0)
-    logits = torch.matmul(hidden_states.float(), lm_head_weights.t().float())
+    # Align dtypes to avoid mixed-dtype mm under compile/FSDP
+    logits = torch.matmul(hidden_states.to(lm_head_weights.dtype), lm_head_weights.t())
     if lm_head_bias is not None:
         logits = logits + lm_head_bias
-    logits = logits.float().div_(temperature)
-
-    loss_flat, logits_flat = per_token_fn(logits, shifted_labels, vocab_size=V)
-    ent = entropy_from_logits(logits_flat.detach().bfloat16())
-    return loss_flat, ent
+    logits = logits / temperature
+    # Per-token logprob (memory-efficient path). per_token_fn may return (logprobs, logits_flat) or just logprobs
+    loss_out = per_token_fn(logits, shifted_labels, vocab_size=V)
+    if isinstance(loss_out, tuple):
+        loss_bxl = loss_out[0]
+        logits_flat = loss_out[1]
+    else:
+        loss_bxl = loss_out
+        B, Lc, V_local = logits.shape
+        logits_flat = logits.reshape(-1, V_local)
+    # Entropy is computed only for valid (response) token positions (= valid labels)
+    B, Lc, V_local = logits.shape
+    logits_flat_view = logits.reshape(-1, V_local)
+    mask_flat = (shifted_labels.reshape(-1) != -100)
+    if mask_flat.any():
+        ent_valid = COMPUTE_ENTROPY_FN(logits_flat_view[mask_flat].detach().bfloat16())
+        ent_all = torch.zeros(B * Lc, device=logits.device, dtype=torch.float32)
+        ent_all[mask_flat] = ent_valid.to(dtype=ent_all.dtype)
+    else:
+        ent_all = torch.zeros(B * Lc, device=logits.device, dtype=torch.float32)
+    return loss_bxl.reshape(-1), ent_all
 
 ce_loss_and_entropy_logsoftmax = partial(
-    fused_log_probs_and_entropy_fn, per_token_fn=per_token_log_probs_from_log_softmax
+    fused_log_probs_and_entropy_fn, per_token_fn=logprobs_from_logits
 )
 
 def grpo_loss_and_entropy_ce_fn(
@@ -394,45 +265,87 @@ def grpo_loss_and_entropy_ce_fn(
     clip_high: float = 0.4,
     clip_ratio_c: float = 1e32,
     ce_loss_and_entropy_fn: Callable = ce_loss_and_entropy_logsoftmax,
+    per_token_fn: Callable = logprobs_from_logits,
+    loss_chunksize: int | None = None,
     **unused_kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute per-token negative log probabilities (GRPO loss) and entropies in one shot without chunking.
+    Compute per-token negative log probabilities (GRPO loss) and entropies.
+    If loss_chunksize is provided, compute along time dimension in chunks to reduce peak memory.
     """
-    policy_logprobs, entropy = ce_loss_and_entropy_fn(
-        lm_head_weights, lm_head_bias, hidden_states, labels, temperature
-    )
+    B, T, _ = hidden_states.shape
+    V = lm_head_weights.size(0)
+    shifted_labels_full = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+
+    if loss_chunksize is not None and loss_chunksize > 0 and loss_chunksize < T:
+        device = hidden_states.device
+        # store outputs as float32 for downstream stability, but compute logits in bf16
+        policy_logprobs_bt = torch.zeros((B, T), device=device, dtype=torch.float32)
+        entropy_bt = torch.zeros((B, T), device=device, dtype=torch.float32)
+
+        for start in range(0, T, loss_chunksize):
+            end = min(start + loss_chunksize, T)
+            hs_chunk = hidden_states[:, start:end, :]
+            # Compute logits for chunk: [B, Lc, V]
+            logits = torch.matmul(hs_chunk.to(lm_head_weights.dtype), lm_head_weights.t())
+            if lm_head_bias is not None:
+                logits = logits + lm_head_bias
+            logits = logits / temperature
+            # Per-token logprobs (memory-efficient) and entropy (response tokens only)
+            shifted_labels_chunk = shifted_labels_full[:, start:end]
+            loss_out = per_token_fn(logits, shifted_labels_chunk, vocab_size=V)
+            if isinstance(loss_out, tuple):
+                logprobs_bxl = loss_out[0]
+                logits_flat = loss_out[1]
+            else:
+                logprobs_bxl = loss_out
+                Bc, Lc_local, Vc = logits.shape
+                logits_flat = logits.reshape(-1, Vc)
+            Lc = end - start
+            policy_logprobs_bt[:, start:end] = logprobs_bxl.reshape(B, Lc)
+
+            # entropy on valid rows only
+            valid_mask = (shifted_labels_chunk.reshape(-1) != -100)
+            if valid_mask.any():
+                ent_valid = COMPUTE_ENTROPY_FN(logits_flat[valid_mask].detach().bfloat16())
+                ent_chunk = torch.zeros(B * Lc, device=device, dtype=torch.float32)
+                ent_chunk[valid_mask] = ent_valid.to(dtype=ent_chunk.dtype)
+                entropy_bt[:, start:end] = ent_chunk.reshape(B, Lc)
+
+        policy_logprobs = policy_logprobs_bt.reshape(-1)
+        entropy = entropy_bt.reshape(-1)
+    else:
+        # Non-chunked path: use fused fn with provided per_token_fn to avoid N*V full log_softmax materialization
+        policy_logprobs, entropy = fused_log_probs_and_entropy_fn(
+            lm_head_weights, lm_head_bias, hidden_states, labels, temperature, per_token_fn=per_token_fn
+        )
+
     if old_logprobs is None:
         old_logprobs = policy_logprobs.detach()
     neg_log_ratio = policy_logprobs - old_logprobs
     ratio = torch.exp(neg_log_ratio)
 
-    # 2) Determine clipping bounds
     lower = 1.0 - clip_low
     upper = 1.0 + clip_high
-
-    # 3) Compute per-token surrogate losses
     loss_unclipped = -advantages * ratio
     loss_clipped = -advantages * torch.clamp(ratio, lower, upper)
-    # loss_clipped_dual = -advantages * clip_ratio_c
-
-    # 4) Standard PPO clipping: max(unclipped, clipped)
     loss_clip1 = torch.maximum(loss_unclipped, loss_clipped)
+    
+    # Dual-clip for negative advantages (matching VERL implementation)
+    loss_clipped_dual = -advantages * clip_ratio_c
+    loss_clip2 = torch.minimum(loss_clip1, loss_clipped_dual)
+    # Apply dual clip only when advantages < 0
+    is_negative = advantages < 0
+    pg_loss_token = torch.where(is_negative, loss_clip2, loss_clip1)
 
-    # 5) Dual-clip step for negative advantages: cap at clip_ratio_c
-    # is_negative = advantages < 0
-    # loss_clip2 = torch.minimum(loss_clip1, loss_clipped_dual)
-
-    # Final per-token loss selection
-    # pg_loss = torch.where(is_negative, loss_clip2, loss_clip1)
-    pg_loss = loss_clip1
-
-    # mask out positions where shifted label is ignore_index (-100)
     shifted_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
-    mask = shifted_labels.view(-1) != -100
-    pg_loss = torch.where(mask, pg_loss, torch.zeros_like(pg_loss))
-    pg_loss = pg_loss.sum()
-    return pg_loss, entropy, torch.abs(neg_log_ratio.detach()), loss_clip1.detach(), loss_unclipped.detach(), loss_clipped.detach()
+    mask_flat = (shifted_labels.reshape(-1) != -100)
+    # Mean over masked tokens (VERL token-mean semantics)
+    pg_loss_vec = torch.where(mask_flat, pg_loss_token, torch.zeros_like(pg_loss_token))
+    denom = mask_flat.sum().clamp(min=1).to(dtype=pg_loss_vec.dtype)
+    pg_loss = pg_loss_vec.sum() / denom
+    # Return raw log-ratio (detached) so callers can derive proper KL/clipfrac diagnostics
+    return pg_loss, entropy, (neg_log_ratio.detach()), loss_clip1.detach(), loss_unclipped.detach(), loss_clipped.detach()
 
 grpo_loss_and_entropy_ce_from_logsoftmax = partial(
     grpo_loss_and_entropy_ce_fn, ce_loss_and_entropy_fn=ce_loss_and_entropy_logsoftmax
@@ -445,6 +358,9 @@ def compute_dual_clip_grpo_loss(
     clip_low: float,
     clip_high: float,
     clip_ratio_c: float,
+    compute_entropy: bool = True,
+    apply_entropy_bonus: bool = True,
+    entropy_coeff: float = 0.0,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Compute GRPO loss using the dual-clip PPO algorithm.
@@ -467,20 +383,17 @@ def compute_dual_clip_grpo_loss(
         metrics (dict): Dictionary of metric values:
             'loss', 'pg_loss', 'pg_clip', 'pg_clip_lower', 'kl_div', 'entropy'.
     """
-    # torch.autograd.set_detect_anomaly(True)
-    # print("\033[1;91;40mDEBUG: remove torch.autograd.set_detect_anomaly(True)\033[0m")
     batch_ids = minibatch["batch_ids"]
     batch_position_ids = minibatch["batch_position_ids"]
     output_indices = minibatch["output_indices"]
     old_logprobs = minibatch["reference_output_logprobs"]
     advantages = minibatch["advantages"]
-    output_lens_broadcasted = minibatch["output_lens_broadcasted"]
+
     labels = minibatch["labels"]
 
-
-    # torch.distributed.breakpoint()
-    grpo_output = policy_model.forward(
+    grpo_output = policy_model(
         input_ids=batch_ids,
+        attention_mask=minibatch.get("attention_mask", None),
         position_ids=batch_position_ids,
         labels=labels,
         use_cache=False,
@@ -489,100 +402,114 @@ def compute_dual_clip_grpo_loss(
         clip_low=clip_low,
         clip_high=clip_high,
         clip_ratio_c=clip_ratio_c,
+        compute_entropy=compute_entropy,
     )
-    #### DEBUG #####
-    # old_logprobs.dtype()
-
-    # model_out = policy_model(
-    #     input_ids=batch_ids,
-    #     position_ids=batch_position_ids,
-    #     labels=labels,
-    #     use_cache=False,
-    # )
-
-    # policy_logprobs = model_out.loss
-    ##### DEBUG #####
-    # minibatch['samples'][0].keys()
-    # minibatch['samples'][1]['sample_text']
-    # from transformers import AutoTokenizer
-    # tokenizer = AutoTokenizer.from_pretrained(policy_model.config._name_or_path)
-    # tokenizer.decode(batch_ids[:,output_indices+1][:,:100].squeeze().tolist())
-    # tokenizer.decode(labels[labels!=-100][:100])
-    # tokenizer.decode(batch_ids[labels!=-100][:100].squeeze().tolist())
-    # tokenizer.decode(batch_ids[:, (reference_logprobs!=0) * (policy_logprobs==0)][:100].squeeze().tolist())
-    # (batch_ids[labels!=-100] - labels[labels!=-100]).sum()
-    # print(tokenizer.decode(batch_ids[0,:100].squeeze().tolist()))
-    # print(tokenizer.decode(batch_ids[:,-1000:].squeeze().tolist()))
-    # non_zero_logprobs = policy_logprobs[policy_logprobs != 0]
-    # torch.abs(non_zero_logprobs).mean()
-    # pol_ref = torch.abs(policy_logprobs - reference_logprobs)
-    # kl_div[kl_div != 0].mean()
-    # torch.distributed.breakpoint()
-    # print(tokenizer.decode(batch_ids[:,115:120].squeeze().tolist()))
-    # print(policy_logprobs[1164:1500])
-    # print(reference_logprobs[1164:1500])
-    # policy_logprobs[policy_logprobs != 0].shape
-    # reference_logprobs[reference_logprobs != 0].shape
-    # diff = torch.abs(policy_logprobs - reference_logprobs)/torch.abs((policy_logprobs+reference_logprobs)/2+1e-10)
-    # idx = diff.argsort(descending=True)
-    # diff[idx[:10]]
-    # i = idx[0]
-    # [print(f"reflogprobs: {reference_logprobs[i]}, policylogprobs: {policy_logprobs[i]}, diff: {diff[i]}") for i in idx[:10]]
-    # debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 272: \033[0m diff[diff!=0].mean(): {diff[labels[0]!=-100].mean()}")
-    # print(tokenizer.decode(batch_ids[:,i-10:i+10].squeeze().tolist()))
-    # diff[diff>1e-1].shape
-    # (diff>1e-1).nonzero()
-    # torch.distributed.breakpoint()
-
-    ##### DEBUG #####
-    # pg_loss, neg_log_ratio, loss_clip1, loss_unclipped, loss_clipped, loss_clipped_dual, is_negative = policy_loss(
-    #     policy_logprobs=policy_logprobs,
-    #     old_logprobs=old_logprobs,
-    #     advantages=advantages,
-    #     output_indices=output_indices,
-    #     clip_low=clip_low,
-    #     clip_high=clip_high,
-    #     clip_ratio_c=clip_ratio_c,
-    # )
-
+    
     # Track clipping and loss metrics
-    metrics = {
-        "loss": grpo_output.loss.detach().item(),
-        "pg_clip": (grpo_output.loss_clipped > grpo_output.loss_unclipped).detach()[output_indices].sum().item(),
-        "kl_div": grpo_output.neg_log_ratio[output_indices].sum().item(),
-        "entropy": grpo_output.entropy[output_indices].sum().item(),
-    }
-    # metrics = {
-    #     "loss": pg_loss.detach().item(),
-    #     "pg_loss": pg_loss.detach().item(),
-    #     "pg_clip": (loss_clipped > loss_unclipped).detach().sum().item(),
-    #     "pg_clip_lower": ((loss_clip1 > loss_clipped_dual) & is_negative).detach().sum().item(),
-    #     "kl_div": (-neg_log_ratio.detach()).sum().item(),
-    #     "entropy": model_out.logits[output_indices].sum().item(),
-    # }
-    return grpo_output.loss, metrics
-    
-    
-    # # this is equal to 1 but it keeps the gradient flowing through the policy_logprobs without affecting the value of the pg_loss (it's only the advantages)
-    # prob_ratio = torch.exp(policy_logprobs - policy_logprobs.detach()) # this is 1
-    # pg_loss = -(prob_ratio * advantages) # equal to -advantages since we are maximizing the advantages.
-    
-    # # KL penalty term using the improved approximation
-    # kl_div = compute_kl_divergence(policy_logprobs, reference_logprobs)
-    # num_clamped = (torch.abs(kl_div) > 10).sum().item()
-    # kl_div = torch.clamp(kl_div, min=-10, max=10)
-    # debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 262: \033[0m num_clamped: {num_clamped}")
-    
-    # # Combined loss
-    # loss = pg_loss + kl_coeff * kl_div
-    
-    # loss_metrics = (loss.detach()).sum().item()
-    # pg_loss_metrics = (pg_loss.detach()).sum().item()
-    # kl_div_metrics = (kl_div.detach()).sum().item()
-    # start_time = time.time()
-    # entropy_metrics = model_out.logits[output_indices].sum()
-    # # print(f"Time taken to compute entropy: {time.time() - start_time} seconds", flush=True)
-    # loss = loss.sum()
-    # # torch.distributed.breakpoint()
+    # Aggregate with sums (safe when no valid indices) to avoid NaNs from empty means
+    try:
+        # Use per-token MEAN for logging to avoid scale explosion when later doing token-weighted averaging
+        out_log_ratio = grpo_output.neg_log_ratio[output_indices]
+        kl_val = out_log_ratio.abs().mean().item() if out_log_ratio.numel() > 0 else 0.0
+    except Exception:
+        kl_val = 0.0
+    try:
+        out_entropy = grpo_output.entropy[output_indices]
+        ent_val = out_entropy.mean().item() if out_entropy.numel() > 0 else 0.0
+    except Exception:
+        ent_val = 0.0
+    try:
+        old_entropy = minibatch.get("reference_output_entropies", None)
+        old_ent_val = (old_entropy[output_indices].mean().item()
+                       if old_entropy is not None and old_entropy.numel() > 0 else 0.0)
+    except Exception:
+        old_ent_val = 0.0
 
-    # return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics
+    # Additional diagnostics on output-token positions only
+    try:
+        log_ratio_out = grpo_output.neg_log_ratio[output_indices].float()
+        ratio_out = torch.exp(log_ratio_out)
+        approx_kl = (ratio_out - 1.0 - log_ratio_out).mean().item() if log_ratio_out.numel() > 0 else 0.0
+        clipfrac_upper = (ratio_out > (1.0 + clip_high)).float().mean().item() if ratio_out.numel() > 0 else 0.0
+        clipfrac_lower = (ratio_out < (1.0 - clip_low)).float().mean().item() if ratio_out.numel() > 0 else 0.0
+        log_ratio_mean = log_ratio_out.mean().item() if log_ratio_out.numel() > 0 else 0.0
+        log_ratio_std = (log_ratio_out.std(unbiased=False).item() if log_ratio_out.numel() > 1 else 0.0)
+    except Exception:
+        approx_kl = 0.0
+        clipfrac_upper = 0.0
+        clipfrac_lower = 0.0
+        log_ratio_mean = 0.0
+        log_ratio_std = 0.0
+
+    # Advantage stats on the very same output positions
+    try:
+        adv_out = advantages[output_indices].float()
+        adv_mean = adv_out.mean().item() if adv_out.numel() > 0 else 0.0
+        adv_std = (adv_out.std(unbiased=False).item() if adv_out.numel() > 1 else 0.0)
+        adv_pos_frac = (adv_out > 0).float().mean().item() if adv_out.numel() > 0 else 0.0
+        adv_zero_frac = (adv_out == 0).float().mean().item() if adv_out.numel() > 0 else 0.0
+    except Exception:
+        adv_mean = adv_std = adv_pos_frac = adv_zero_frac = 0.0
+
+    # Mask sanity: compare labeled output token count vs output_indices length
+    try:
+        labeled_nonmasked = (labels != -100).sum().item()
+        expected_out = int(output_indices.numel())
+    except Exception:
+        labeled_nonmasked = 0
+        expected_out = 0
+
+    # Loss scales for consistent comparison
+    try:
+        loss_sum = grpo_output.loss.detach().item()
+        loss_per_token = (loss_sum / max(1, expected_out)) if expected_out > 0 else float(loss_sum)
+        # Optional: per-sample average if provided
+        try:
+            num_samples_tensor = minibatch.get("num_samples", None)
+            num_samples = int(num_samples_tensor.item()) if num_samples_tensor is not None else 0
+        except Exception:
+            num_samples = 0
+        loss_per_sample = (loss_sum / max(1, num_samples)) if num_samples > 0 else float(loss_sum)
+    except Exception:
+        loss_sum = grpo_output.loss.detach().item() if hasattr(grpo_output.loss, 'detach') else float(grpo_output.loss)
+        loss_per_token = float(loss_sum)
+        loss_per_sample = float(loss_sum)
+
+    metrics = {
+        "loss": loss_sum,
+        "loss_per_token": loss_per_token,
+        "loss_per_sample": loss_per_sample,
+        "pg_loss": loss_sum,  # Add pg_loss for consistency with VERL logging
+        "pg_clip": (grpo_output.loss_clipped > grpo_output.loss_unclipped).detach()[output_indices].sum().item(),
+        "kl_div": kl_val,
+        "entropy": ent_val,
+        "old_policy_entropy": old_ent_val,
+        "entropy_coeff": float(entropy_coeff),
+        # New diagnostics
+        "approx_kl": approx_kl,
+        "clipfrac_upper": clipfrac_upper,
+        "clipfrac_lower": clipfrac_lower,
+        "log_ratio_mean": log_ratio_mean,
+        "log_ratio_std": log_ratio_std,
+        "adv_mean": adv_mean,
+        "adv_std": adv_std,
+        "adv_pos_frac": adv_pos_frac,
+        "adv_zero_frac": adv_zero_frac,
+    }
+    
+    # Apply entropy bonus to loss if enabled
+    final_loss = grpo_output.loss
+    try:
+        if compute_entropy and apply_entropy_bonus and float(entropy_coeff) != 0.0:
+            # Mean entropy over output token positions
+            out_entropy = grpo_output.entropy[output_indices]
+            if out_entropy.numel() > 0:
+                entropy_loss = out_entropy.mean()
+                final_loss = final_loss - float(entropy_coeff) * entropy_loss
+    except Exception:
+        # Fail-safe: keep original loss if anything goes wrong
+        final_loss = grpo_output.loss
+
+    return final_loss, metrics
+    
+    

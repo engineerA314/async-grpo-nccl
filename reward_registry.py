@@ -7,6 +7,8 @@ a {"reward": float, "reward_info": {...}} dict given a sample.
 
 from typing import Dict, Callable, Any
 from enum import Enum
+import re
+import logging
 
 from deepscaler_math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
 from countdown_reward import format_reward_function, answer_reward_function
@@ -73,17 +75,93 @@ def countdown_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     return {"reward": reward, "format_reward": format_r}
 
 
+# ----------------------------------- CUSTOM IMPLEMENTATION -----------------------------------
+def _base_reward_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """
+    A basic reward adapter that checks for the presence of 'reward' in the sample.
+    This can be used for datasets that are pre-computed with rewards.
+    """
+    if "reward" not in sample:
+        raise ValueError("Sample does not contain 'reward' key.")
+    return {"reward": float(sample["reward"])}
+
+
+def countdown_reward_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """
+    Adapter for the Countdown Tasks reward.
+    """
+    RESPONSE_PROMPT = "Let me solve this step by step.\n<think>"
+    # Isolate model's generated text by splitting off the prompt
+    full_text = sample.get('sample_text', '')
+    output = full_text.split(sample.get('input', ''), 1)[1]
+    response = "<think>" + output
+    # Prepend the RESPONSE_PROMPT to reconstruct the opening <think> tag
+    format_r = format_reward_function(response, end_token=sample.get('end_token', ''))
+    answer_r = answer_reward_function(response, numbers=sample.get('nums'), target=sample.get('target'))
+    reward = format_r * 0.1 + answer_r
+    return {"reward": reward, "format_reward": format_r}
+
+# ----------------------------------- END OF CUSTOM IMPLEMENTATION -----------------------------------
 class RewardType(str, Enum):
-    """Enum of available reward adapter names."""
+    """
+    An enumeration of the available reward adapters.
+    This allows for pluggable reward functions in the GRPO pipeline.
+    """
+
     MATHD = "mathd"
     SYMPY = "sympy"
     COUNTDOWN = "countdown"
+    BASE = "base" # for datasets that are pre-computed with rewards.
+    GSM8K = "gsm8k" # GSM8K math word problems
+
+
+def _extract_final_answer_from_text(text: str) -> str:
+    """Strictly extract value inside <final_answer>...</final_answer>.
+
+    This mirrors the behavior used in the async-grpo and VERL implementations:
+    - Only the tag contents are considered
+    - Case-insensitive match on the tag name
+    - No additional fallbacks (e.g., last number, #### pattern)
+    """
+    m = re.search(r"<final_answer>\s*([^<]+?)\s*</final_answer>", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _normalize_numeric_string(s: str) -> str:
+    """Normalize numeric strings by removing commas and trimming spaces.
+
+    Note: We intentionally do NOT strip trailing periods or apply any other
+    heuristics so that the behavior is strictly aligned with VERL and
+    async-grpo implementations.
+    """
+    return s.replace(",", "").strip()
+
+
+def gsm8k_reward_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """Strict GSM8K reward: only accept <final_answer>...</final_answer> content.
+
+    Behavior matches async-grpo and VERL final-answer reward semantics.
+    """
+    full_text = sample.get("sample_text", "")
+    prompt = sample.get("input", "")
+    # Extract only the model completion (post-prompt) to mirror async-grpo
+    completion = full_text[len(prompt):] if prompt and full_text.startswith(prompt) else full_text
+
+    pred = _extract_final_answer_from_text(completion)
+    gt = str(sample.get("answer", "")).strip()
+
+    correct = _normalize_numeric_string(pred) == _normalize_numeric_string(gt)
+    return {"reward": float(bool(correct))}
 
 
 REWARD_ADAPTERS: Dict[RewardType, Callable[..., Dict[str, Any]]] = {
     RewardType.MATHD: mathd_adapter,
     RewardType.SYMPY: sympy_adapter,
     RewardType.COUNTDOWN: countdown_adapter,
+    RewardType.BASE: _base_reward_adapter, # for datasets that are pre-computed with rewards.
+    RewardType.GSM8K: gsm8k_reward_adapter, # GSM8K math word problems
 }
 
 

@@ -8,6 +8,23 @@ from transformers import AutoTokenizer
 import torch.distributed as dist
 # Configure numba logging
 logging.getLogger("numba").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("GRPO_LOGGING_LEVEL", "INFO"))
+
+def _rank_str():
+    """Return a robust rank string for logging.
+
+    Prefer torch.distributed rank when initialized; otherwise fall back to
+    environment RANK. LOCAL_RANK is always 0 in our per-actor-per-GPU setup and
+    should not be used for identity in logs.
+    """
+    try:
+        import torch.distributed as dist  # local import to avoid hard dep at import time
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        pass
+    return os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "?"
 
 @njit
 def get_output_logits_indices_numba(input_lens, output_lens):
@@ -140,83 +157,55 @@ def make_dummy_batch(batched_questions, device):
     }
 
 def post_process_batch(batched_questions, device, constant_length_samples=None):
+    # logger.info(f"[{_rank_str()}] post_process_batch: batched_questions shape={len(batched_questions)}")
+    
+    
     # Handle dummy batch: emit a minimal placeholder batch
     if len(batched_questions) == 1 and batched_questions[0].get('dummy', False):
         return make_dummy_batch(batched_questions, device)
     output_indices, output_lens = get_output_logits_indices(batched_questions, device)
     modified_samples = [q for q in batched_questions if q['modified_reward'] is not None]
     non_modified_samples = [q for q in batched_questions if q['modified_reward'] is None]
-    # if int(os.environ['RANK']) == 0:
-    #     if len(modified_samples) > 0:
-    #         sample = random.choice(modified_samples)
-    #     else:
-    #         sample = random.choice(batched_questions)
-    #     print(
-    #         # f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text'][:500]}\n ... \n{sample['sample_text'][-4000:]}\n" +
-    #         f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text']}\n" +
-    #         f"\033[1;96;40mReward:\033[0m {sample['reward']}\n" +
-    #         f"\033[1;96;40mGround Truth Answer:\033[0m {sample['answer']}\n" +
-    #         (f"\033[1;96;40mParsed Ground Truth Answer:\033[0m {sample['parsed_gt_answer']}\n" if 'parsed_gt_answer' in sample else "") +
-    #         (f"\033[1;96;40mParsed Attempt: {sample['parsed_attempt']}\033[0m\n" if 'parsed_attempt' in sample else f"\033[1;38;5;196mFailed verification\033[0m\n")
-    #     )
+
     advantages = np.array([s['advantage'] for s in batched_questions])
-    # print("\033[1;91;40mDEBUG using sample lens (not outputlens to broadcast)\033[0m")
+
     sample_lens = np.array([s['input_len'] +s['output_len'] for s in batched_questions])
     advantages = torch.from_numpy(broadcast_values(advantages, sample_lens)).to(device).to(torch.float32)
-    
+
     if constant_length_samples is None:
         output_lens_broadcasted = torch.from_numpy(broadcast_values(output_lens, sample_lens)).to(device).to(torch.float32)
     else:
         output_lens_broadcasted = torch.ones_like(advantages).to(device).to(torch.float32) * constant_length_samples
 
-    # if any(s['sample_logprobs'] is None for s in batched_questions)\
-    #       or any(torch.tensor(s['sample_logprobs']).ndim == 0 for s in batched_questions):
-    #     torch.distributed.breakpoint(dist.get_rank())
     reference_output_logprobs = torch.cat(
         [torch.tensor(s['sample_logprobs']) for s in batched_questions]
     ).to(device).to(torch.float32)
-
+    # Optional: old-policy entropy if provided by logprob worker (robust to partial None)
+    try:
+        ent_tensors = []
+        for s in batched_questions:
+            ent = s.get('sample_entropies', None)
+            if ent is None:
+                # Fallback: zeros with same length as logprobs for this sample
+                ent = [0.0] * len(s.get('sample_logprobs') or [])
+            ent_tensors.append(torch.tensor(ent))
+        reference_output_entropies = torch.cat(ent_tensors).to(device).to(torch.float32) if ent_tensors else torch.zeros_like(reference_output_logprobs)
+    except Exception:
+        reference_output_entropies = torch.zeros_like(reference_output_logprobs)
     batch_ids, batch_position_ids, labels = get_input_for_logprobs(batched_questions, output_indices, device)
-    # output_mask = torch.zeros_like(batch_ids, dtype=torch.float32, device=device)
-    # output_mask[:,output_indices+1] = 1
-    # # Debug: Assert that the output mask correctly selects the output token ids
-    # # Compute the output tokens selected by the mask from batch_ids.
-    # # Note: batch_ids has shape [1, total_length] and output_mask is of the same shape.
-    # output_tokens_from_mask = batch_ids[0][output_mask[0].bool()]
-    # # Build the expected output tokens by concatenating the output portions from each sample.
-    # expected_output_tokens = torch.cat([torch.tensor(s['output_token_ids'], device=device) for s in batched_questions]).cuda()
-
-    # # Here we assume that each sample's output tokens are given by sample_ids[input_len:].
-    # expected_output_tokens = []
-    # for sample in batched_questions:
-    #     sample_ids_tensor = torch.tensor(sample['sample_ids'], device=device)
-    #     expected_output_tokens.append(sample_ids_tensor[sample['input_len']:])
-    # expected_output_tokens = torch.cat(expected_output_tokens)
-
-    # # Perform the assertion to ensure the mask correctly maps to the output tokens.
-    # assert torch.equal(output_tokens_from_mask, expected_output_tokens), (
-    #     f"Output mask mapping error: expected output tokens {expected_output_tokens} "
-    #     f"but got {output_tokens_from_mask}"
-    # )
-    # torch.distributed.barrier()
-    # torch.distributed.breakpoint()
-    # torch.distributed.barrier()
-    # batch_ids[:,-1000:]
-    # torch.distributed.barrier()
-    # torch.distributed.breakpoint()
-    # torch.distributed.barrier()
-    print(f"\033[1;32mYielding batch of length {output_lens.sum()} Rank: {os.environ['LOCAL_RANK']}\033[0m")
-    return {
+    
+    _out = {
         "batch_ids": batch_ids.contiguous(),
         "batch_position_ids": batch_position_ids.contiguous(),
         "output_indices": output_indices.contiguous(),
         "advantages": advantages.contiguous(),
         "reference_output_logprobs": reference_output_logprobs.contiguous(),
+        "reference_output_entropies": reference_output_entropies.contiguous(),
         "output_lens_broadcasted": output_lens_broadcasted.contiguous(),
-        "num_output_tokens_non_masked": torch.tensor((labels != -100).sum(), device=device, dtype=torch.float32),
+        "num_output_tokens_non_masked": (labels != -100).sum().to(torch.float32),
         "num_output_tokens": torch.tensor(output_lens.sum(), device=device, dtype=torch.float32),
         "num_samples": torch.tensor(len(batched_questions), device=device, dtype=torch.float32),
-        "max_reward_in_group": torch.tensor(sum([s['max_reward_in_group'] for s in batched_questions]), device=device, dtype=torch.float32),
+        "max_reward_in_group": torch.tensor(0.0, device=device, dtype=torch.float32),
         "total_modified_reward": torch.tensor(sum([s['modified_reward'] for s in modified_samples]), device=device, dtype=torch.float32) if len(modified_samples) > 0 else torch.tensor(0.0, device=device, dtype=torch.float32),
         "total_non_modified_reward": torch.tensor(sum([s['reward'] for s in non_modified_samples]), device=device, dtype=torch.float32) if len(non_modified_samples) > 0 else torch.tensor(0.0, device=device, dtype=torch.float32),
         "num_modified_samples": torch.tensor(len(modified_samples), device=device, dtype=torch.float32),
@@ -225,5 +214,10 @@ def post_process_batch(batched_questions, device, constant_length_samples=None):
         "labels": labels,
         "total_reward_rank": torch.tensor(sum([s['reward'] for s in batched_questions]), device=device, dtype=torch.float32),
         "truncated_sample": torch.tensor(sum([s['truncated_sample'] for s in batched_questions]), device=device, dtype=torch.float32),
-        "advantage_is_zero": torch.tensor(sum([s['advantage_is_zero'] for s in batched_questions]), device=device, dtype=torch.float32),
-    } 
+        "advantage_is_zero": torch.tensor(0.0, device=device, dtype=torch.float32),
+    }
+    try:
+        _out["uids"] = torch.tensor([int(s.get("__uid__", -1)) for s in batched_questions], device=device)
+    except Exception:
+        pass
+    return _out

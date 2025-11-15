@@ -1,257 +1,257 @@
 import argparse
 import asyncio
-from datetime import timedelta
-import gc
 import os
 import time
-from typing import List
-import uuid
-import torch
-import ray
-from setup_model import setup_model  # Updated function
-from vllm_registry import get_or_create_registry
-from sample_processing_utils import get_output_logits_indices, get_input_for_logprobs
 import logging
-# Set logging level to debug
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-logger.debug("Logging initialized at DEBUG level in logprob_worker.py")
+import ray
+import torch
+import torch.distributed as dist
+from typing import List, Dict, Any, Tuple
+import gc
+import uuid
 
+# from weight_sharding_manager import WeightShardingManager # This is now handled by UnifiedWorker
 
-def init_logprob_dist_env():
-    # torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    # args.local_rank = int(os.environ["LOCAL_RANK"])
-    torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=180))
-    # args.global_rank = torch.distributed.get_rank()
-    tensor = torch.ByteTensor([False]).cuda()
-    torch.distributed.all_reduce(tensor)
-    torch.distributed.barrier()
-
-@ray.remote(num_gpus=1, num_cpus=4)
-class LogprobWorker:
-    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000, temperature: float = 1.0):
-        self.args = argparse.Namespace(
-            model_name_or_path=model_path,
-            worker_id=worker_id,
-            fsdp_sharding_strategy="FULL_SHARD",
-            temperature=temperature,
-            mode='eval',
-        )
-        self.worker_id = worker_id
-        self.max_tokens_per_gpu = max_tokens_per_gpu
-        print(f"Initializing {self.__class__.__name__} for logprobs with model path: {model_path}")
-        init_logprob_dist_env()
-        self.model = setup_model(self.args).cuda()
-        self.device = next(self.model.parameters()).device
-        self.registry = get_or_create_registry("logprob_vllm_registry")
+@ray.remote
+class LogProbFSDPWorker:
+    """
+    A Ray Actor that acts as the public interface for a group of UnifiedWorkers
+    performing log probability calculations. It preserves the efficient, stateful
+    batching logic of the original async-grpo LogprobWorker and is analogous to
+    the GenerationVLLMWorker controller.
+    """
+    def __init__(
+        self,
+        group_id: str,
+        worker_handles: list,
+        fsdp_group_ranks: List[int],
+        trainer_controller_handle: ray.actor.ActorHandle,
+        max_tokens: int,
+    ):
+        self.group_id = group_id
+        self.worker_handles = worker_handles
+        self.fsdp_group_ranks = fsdp_group_ranks
+        self.max_tokens_per_gpu = max_tokens
+        self.world_size = len(worker_handles)
         self.batching_queue = asyncio.Queue()
-        self.setup_registration()
-        self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
-    
-    def setup_registration(self):
-        try:
-            ray.get(self.registry.register.remote(service_id=self.worker_id))
-            print(f"Worker {self.worker_id} registered.")
-        except Exception as e:
-            print(f"Error during registration for worker {self.worker_id}: {e}")
-
-    def free_memory(self):
-        gc.collect()
-        torch.cuda.empty_cache()
-    
-    async def update_weights(self, new_state_dict: dict):
-        '''kill the centralizer loop before updating the weights'''
-        await self.batching_queue.put(None)
-        await self._centralizer_loop
         
-        self.free_memory()
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                param.data = new_state_dict[name].to(param.device).to(param.dtype)
-        print(f"Model loaded successfully on service {self.worker_id}.")
-        # self.model = setup_model(self.args, model).cuda()
-        self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
-        print(f"Logprob weights updated successfully on service {self.worker_id}.")
-        return True
+        # This loop pulls requests from the queue, batches them, and processes them.
+        self.centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
 
-    async def inference(self, sample: dict, **kwargs) -> dict:
+    def get_worker_handles(self) -> List[ray.actor.ActorHandle]:
+        """Returns the handles to the UnifiedWorker actors it manages."""
+        return self.worker_handles
+
+    async def sync_weights(self, group_name: str, source_rank_in_collective_group: int):
+        """Triggers weight synchronization for all managed workers."""
+        if not self.worker_handles:
+            pass
+            return
+
+        sync_futures = [
+            worker.sync_weights.remote(group_name, source_rank_in_collective_group)
+            for worker in self.worker_handles
+        ]
+        await asyncio.gather(*sync_futures)
+
+    async def initialize_fsdp(self, state_dict_to_load: bytes = None):
         """
-        Compute log probabilities synchronously using get_per_token_logps, 
-        but provide an asynchronous interface.
-        Expected sample dict includes 'sample_ids'
+        Initializes the FSDP model structure on all managed workers.
+        If state_dict_to_load is provided, it also loads the weights.
         """
+        if not self.worker_handles:
+            return
+
+        # First, create the FSDP shells on all workers.
+        init_futures = [
+            worker.init_model.remote(for_computation=False, fsdp_group_ranks=self.fsdp_group_ranks) 
+            for worker in self.worker_handles
+        ]
+        await asyncio.gather(*init_futures)
+
+        if state_dict_to_load:
+            await self.load_initial_weights(state_dict_to_load)
+        
+    async def load_initial_weights(self, state_dict_to_load: bytes):
+        """Loads the provided state_dict into all managed workers."""
+        load_futures = [worker._load_initial_weights.remote(state_dict_to_load) for worker in self.worker_handles]
+        await asyncio.gather(*load_futures)
+        
+        worker_ranks = await asyncio.gather(*[w.get_global_rank.remote() for w in self.worker_handles])
+        
+    async def _process_batch(self, batch: List[Dict]) -> List[Dict]:
+        """
+        Processes a finalized batch of requests by dispatching the computation
+        to the UnifiedWorker pool. Now uses sample_ids directly from generation worker
+        instead of tokenizing again.
+        """
+        world_size = len(self.worker_handles)
+        if not batch:
+            return []
+            
+        # Simple scatter operation
+        chunks = [[] for _ in range(world_size)]
+        for i, sample in enumerate(batch):
+            chunks[i % world_size].append(sample)
+        
+        # Create dummy sample for empty chunks to ensure FSDP synchronization
+        dummy_sample = {'sample_ids': [1], 'dummy': True, 'request_id': 'dummy_fsdp_sync'}
+        
+        processed_samples_map = {}
+        # Send raw samples to each worker; let workers build tensors on-GPU
+        futures = []
+        worker_chunks = []
+        for i, worker in enumerate(self.worker_handles):
+            chunk_to_process = chunks[i] if chunks[i] else [dummy_sample]
+            worker_chunks.append(chunk_to_process)
+            futures.append(worker.compute_log_probs_from_samples.remote(chunk_to_process))
+        worker_results = await asyncio.gather(*futures)
+
+        # Assign results back to samples (now dicts with logprobs/entropies)
+        for chunk_samples, chunk_results in zip(worker_chunks, worker_results):
+            for s, res in zip(chunk_samples, chunk_results):
+                if s.get('dummy'):
+                    continue
+                if isinstance(res, dict):
+                    s["sample_logprobs"] = res.get("logprobs")
+                    s["sample_entropies"] = res.get("entropies")
+                else:
+                    # backward-compat: list means only logprobs
+                    s["sample_logprobs"] = res
+                    s["sample_entropies"] = None
+                # Preserve alignment id if present
+                try:
+                    s["__uid__"] = s.get("__uid__", s.get("uid", s.get("id", -1)))
+                except Exception:
+                    pass
+                processed_samples_map[tuple(s["sample_ids"])] = s
+
+        # Re-order the results to match the original input 'batch' order
+        final_results = [
+            processed_samples_map.get(tuple(s["sample_ids"])) for s in batch
+        ]
+
+        return [res for res in final_results if res is not None]
+
+    async def inference(self, sample: Dict, **kwargs) -> Dict:
+        """Asynchronous interface for external callers."""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self.batching_queue.put_nowait((future, sample))
+        await self.batching_queue.put((future, sample))
         result = await future
         return result
-    
+
     async def _centralize_inference_requests(self):
-        # current_request acts as a pending request that didn't fit in the previous batch.
-        current_request = None  
+        """
+        An asyncio loop that pulls requests from a queue, groups them into
+        batches based on token count, and processes them.
+        Now uses sample_ids length instead of re-tokenizing.
+        """
+        pending_request = None
         while True:
-            # If there's no pending request, get one from the queue.
-            # Otherwise, use the one left from the previous batch.
-            current_request = await self.batching_queue.get() if current_request is None else current_request
-            if current_request is None:
-                return None
-            logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
-            logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m length of batching queue: {self.batching_queue.qsize()}")
-            inference_requests = [current_request]
-            total_length = len(current_request[1]['sample_ids'])
-            while True:
+            try:
+                if pending_request is None:
+                    try:
+                        # debug wait log suppressed
+                        current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                else:
+                    current_request = pending_request
+                    pending_request = None
+
+                future, sample = current_request
+                
+                inference_requests: List[Tuple[asyncio.Future, Dict]] = [(future, sample)]
+                # Use sample_ids length instead of tokenizing
+                total_length = len(sample.get("sample_ids", []))
+
+                # Dynamically fill a batch with a short timeout.
+                BATCHING_TIMEOUT = 0.01  # 10ms
                 try:
-                    # Attempt to retrieve the next request.
-                    current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
-                    if current_request is None:
-                        logging.debug(f"\033[1;38;2;255;255;0m _centralize_inference_requests line 142: \033[0m received sentinel")
-                        return None
-                    logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
-                    logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m length of batching queue: {self.batching_queue.qsize()}")
-                    len_request = len(current_request[1]['sample_ids'])
-                    # If adding this request would exceed the maximum, break and keep it for next round.
-                    if total_length + len_request > self.max_tokens_per_gpu:
-                        logging.debug(f"\033[1;38;2;255;20;147m _centralize_inference_requests line 147: \033[0m adding this request would exceed the maximum, breaking, total_length: {total_length}, len_request: {len_request}, max_tokens_per_gpu: {self.max_tokens_per_gpu}")
-                        break
-                    # Otherwise, include it in the current batch.
-                    total_length += len_request
-                    inference_requests.append(current_request)
-                except asyncio.TimeoutError:
-                    # Timeout: no more requests available now.
-                    logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 123: \033[0m no more items in the batching queue timeout")
-                    current_request = None
-                    break
-            if inference_requests:
-                futures, samples = zip(*inference_requests)
-                samples_with_logprobs = self._compute_logprobs(samples)
-                logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 129: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
-                for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
-                    if not future.done():
-                        future.set_result(sample_with_logprobs)
+                    while total_length < self.max_tokens_per_gpu:
+                        timeout = BATCHING_TIMEOUT if inference_requests else None # Wait forever for the first request
+                        next_request = await asyncio.wait_for(
+                            self.batching_queue.get(), timeout=timeout
+                        )
+                        next_len = len(next_request[1].get("sample_ids", []))
 
-    def _compute_logprobs(self, samples: List[dict]) -> dict:
+                        if total_length + next_len > self.max_tokens_per_gpu:
+                            pending_request = next_request
+                            break
+
+                        inference_requests.append(next_request)
+                        total_length += next_len
+                except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                    pass # Batching finished
+
+                
+                # Process the finalized batch.
+                futures, samples_to_process = zip(*inference_requests)
+                try:
+                    samples_with_logprobs = await self._process_batch(list(samples_to_process))
+                    
+                    # Create a map from a unique sample identifier to its result
+                    # Use sample_ids as the unique identifier
+                    result_map = {tuple(s['sample_ids']): s for s in samples_with_logprobs}
+
+                    for fut, samp in zip(futures, samples_to_process):
+                        if not fut.done():
+                            result = result_map.get(tuple(samp['sample_ids']))
+                            if result:
+                                fut.set_result(result)
+                            else:
+                                fut.set_exception(Exception(f"Result for sample not found in processed batch."))
+                except Exception as e:
+                    for future_to_set in futures:
+                        if not future_to_set.done():
+                            future_to_set.set_exception(e)
+            except Exception as e:
+                # Ensure pending requests get a response
+                if 'inference_requests' in locals():
+                    for fut, _ in inference_requests:
+                        if not fut.done():
+                            fut.set_exception(e)
+                pending_request = None
+                await asyncio.sleep(1) # Avoid tight loop on error
+
+    async def get_full_cpu_state_dict(self):
         """
-        Synchronously compute log probabilities from the input sample.
+        Retrieves the full CPU state dict from the FSDP group.
+        IMPORTANT: For FSDP world_size > 1 this must be invoked on ALL ranks
+        concurrently because the underlying API performs collective ops.
+        We therefore call get_cpu_state_dict on every worker and return the
+        non-empty bytes (rank 0 in the group will provide it).
         """
-        output_indices, _ = get_output_logits_indices(samples, self.device)
-        input_ids, position_ids, labels = get_input_for_logprobs(samples, output_indices, self.device)
+        if not self.worker_handles:
+            return None
+
         try:
-            self.model.eval()
-            with torch.no_grad():
-                log_probs = self.model(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    labels=labels,
-                ).loss
+            # Trigger the collective on all workers
+            futures = [w.get_cpu_state_dict.remote() for w in self.worker_handles]
+            results = await asyncio.gather(*futures)
+
+            # Only rank 0 will return the pickled bytes; others return None
+            for res in results:
+                if res:
+                    return res
+
+            return None
         except Exception as e:
-            logging.error(f"\033[1;38;2;255;165;0m _compute_logprobs line 149: \033[0m error: {e}")
-            raise e
-        
-        sample_lens = [len(s['sample_ids']) for s in samples]
-        log_probs = torch.split(log_probs, sample_lens)
-        for s, log_prob in zip(samples, log_probs):
-            s['sample_logprobs'] = log_prob.tolist()
-        logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 153: \033[0m computed samples_with_logprobs length of {len(samples)}")
-        return samples
-    
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Start logprob worker service")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
-    args = parser.parse_args()
-    import logging
-    logging.basicConfig(level=logging.DEBUG)
-    ray.init(address="auto", namespace="test")
-    print(ray.get_runtime_context().get_job_id())
-    service_id = f"logprob_worker_{str(uuid.uuid4())}"
-    init_logprob_dist_env()
-    # worker = LogprobWorker.options(
-    #     name=service_id,
-    #     num_gpus=1,
-    #     num_cpus=4,
-    #     runtime_env={
-    #         "env_vars": dict(os.environ)
-    #     },
-    #     # runtime_env={
-    #     #     "pip": [f"-r {os.path.dirname(os.path.abspath(__file__))}/requirements_fsdp.txt"]
-    #     # },
-    # ).remote(args.model_path, service_id)
-    from IPython import embed
-    embed()
+            return None
 
-    while True:
-        try:
-            ray.get_actor("generation_vllm_registry")
-            ray.get_actor("logprob_vllm_registry")
-            print("logprob_vllm_registry found.")
-            break
-        except Exception:
-            print("logprob_vllm_registry not found, sleeping for 2 seconds...")
-            time.sleep(2)
-    
-    from transformers import AutoModelForCausalLM
-    model_ = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-    )
-    new_state_dict = model_.state_dict()
-    from accelerate import init_empty_weights
-    with init_empty_weights():  
-        model = AutoModelForCausalLM.from_pretrained(
-            # args.model_path,
-            "/dev/shm/phi-4",
-        )
-    model.load_state_dict(new_state_dict, assign=True)
-    worker_id = "logprob_worker_1"
-    args_ = argparse.Namespace(
-            model_name_or_path=args.model_path,
-            worker_id=worker_id,
-            fsdp_sharding_strategy="FULL_SHARD",
-        )
-    model, accelerator = setup_model(args_, model)
-    input_ids = [
-            100264, 882, 100266, 4438, 1053, 499, 12849, 279, 8286, 315,
-            264, 6211, 1903, 315, 279, 11552, 315, 1403, 66818, 315,
-            279, 1890, 10801, 1405, 279, 19169, 72359, 449, 279, 7479,
-            315, 279, 1023, 26436, 30, 100265, 100264, 78191, 100266
+    async def load_pretrained_weights_for_testing(self, model_name: str):
+        """
+        Testing-only method: Load pretrained weights on all managed workers for standalone tests.
+        This bypasses the normal orchestrated weight synchronization flow.
+        """
+        if not self.worker_handles:
+            return
+        
+        # Call the testing method on all GPU workers
+        load_futures = [
+            worker.load_pretrained_weights_for_testing.remote(model_name) 
+            for worker in self.worker_handles
         ]
-    batch_ids = torch.tensor([input_ids]).to(accelerator.device)
-    position_ids = torch.arange(len(input_ids)).unsqueeze(0).to(accelerator.device)
-    output_indices = (position_ids[:,1:] - 1).squeeze(0)
-    model_, accelerator_ = setup_model(args_, model)
-    with torch.no_grad():
-        log_probs = get_per_token_logps(model, batch_ids, position_ids, output_indices)
-        log_probs_ = get_per_token_logps(model_, batch_ids, position_ids, output_indices)
-    print(log_probs_ - log_probs)
-    ray.get(worker.update_weights.remote(new_state_dict))
-    # for p_,p in zip(model.parameters(), model_.parameters()):
-    #     if not torch.allclose(p_, p):
-    #         print(f"Parameters do not match: {p_.shape} != {p.shape}")
-    # from IPython import embed
-    # embed()
-    
-    async def main():
-        input_ids = [
-            100264, 882, 100266, 4438, 1053, 499, 12849, 279, 8286, 315,
-            264, 6211, 1903, 315, 279, 11552, 315, 1403, 66818, 315,
-            279, 1890, 10801, 1405, 279, 19169, 72359, 449, 279, 7479,
-            315, 279, 1023, 26436, 30, 100265, 100264, 78191, 100266
-        ]
-        actor_registry = get_or_create_registry("generation_vllm_registry")
-        samples_with_experience = await actor_registry.inference_balanced.remote(
-            {'input_token_ids': input_ids},
-            n=2,
-            temperature=0.8,
-        )
-        registry = get_or_create_registry("logprob_vllm_registry")
-        tasks = [registry.inference_balanced.remote(s) for s in samples_with_experience]
-        samples_with_logprobs = await asyncio.gather(*tasks)
-        return samples_with_logprobs
-    
-    results = asyncio.run(main())
-    print(results)
-    
-    while True:
-        time.sleep(10000)
+        await asyncio.gather(*load_futures)
+        

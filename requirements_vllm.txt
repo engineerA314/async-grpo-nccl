@@ -1,7 +1,10 @@
---extra-index-url https://wheels.vllm.ai/nightly  # No --pre needed
 vllm
+torch==2.6.0
 math-verify[antlr4_13_2]
 ray[default]==2.47.1
 rich
 wrapt_timeout_decorator
 filelock
+protobuf==4.25.3
+pydantic>=2.10
+wandb

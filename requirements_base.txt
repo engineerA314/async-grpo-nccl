@@ -1,5 +1,5 @@
 ray[default]==2.47.1
-torch<2.7
+torch==2.6.0
 torchvision
 # math-verify[antlr4_13_2]
 rich
@@ -10,3 +10,5 @@ sympy
 pylatexenc
 typer
 aiofiles
+tensorboard
+torch-tb-profiler

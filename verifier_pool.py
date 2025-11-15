@@ -12,13 +12,10 @@ from functools import partial
 import ray
 from filelock import FileLock, Timeout
 from wrapt_timeout_decorator import timeout
-from utils import patch_target_module
 from functools import partial
 from reward_registry import get_reward_adapter, RewardType
-# patch_target_module("math_verify.utils.timeout", partial(timeout, use_signals=False))
 
 import numpy as np
-logging.getLogger().setLevel(logging.DEBUG)
 
 
 def cos_fn(t, T, eta_min, eta_max):
@@ -61,14 +58,25 @@ def compute_cosine_reward(gen_length, max_length, format_quality, is_correct,
 class VerifierWorker:
     def __init__(self, worker_id: str):
         self.worker_id = worker_id
-        print(f"Initializing VerifierWorker with id: {worker_id}")
+        # Configure logging for this worker process
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s (%(process)d) - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+        )
+        self.logger = logging.getLogger(__name__)
+        # self.logger.debug(f"Initializing VerifierWorker with id: {worker_id}")
 
     def verify_task(self, sample: dict, reward_fn_name: str, **kwargs) -> dict:
         """Generic verification entry point that applies the named reward adapter."""
+        self.logger.debug(f"VerifierWorker {self.worker_id} received task for reward_fn: {reward_fn_name}")
         adapter = get_reward_adapter(reward_fn_name)
         out = adapter(sample, **kwargs)
+        if "debug_logs" in out:
+            # We are moving away from this, but keep for compatibility
+            sample["debug_logs"] = out.pop("debug_logs")
         sample.update(**out)
         sample['reward_success'] = True
+        # self.logger.debug(f"VerifierWorker {self.worker_id} finished task. Reward: {sample.get('reward')}")
         return sample
 
 @ray.remote
@@ -87,7 +95,6 @@ class VerifierPool:
         self.outfile = Path(output_dir) / "failed_samples_verify.jsonl" if output_dir is not None else Path("failed_samples_verify.jsonl")
         self.outfile.unlink(missing_ok=True)
         Path(str(self.outfile) + '.lock').unlink(missing_ok=True)
-        print(f"\033[38;5;196m\033[1m DEBUG: VerifierPool reward_fns: {self.reward_fns}\033[0m", flush=True)
         
     def create_verifier_worker(self):
         # Create a new worker instance.
@@ -99,14 +106,13 @@ class VerifierPool:
         return worker
 
     async def write_failed_sample(self, sample: dict):
-        print("\033[38;5;196m\033[1m DEBUG: Failed to verify sample \033[0m", flush=True)
         if self.write_failed:
             try:
                 with FileLock(f"{self.outfile}.lock", timeout=20):
                     with open(self.outfile, "a") as f:
                         f.write(json.dumps(sample) + "\n")
             except Timeout:
-                print("Lock acquisition failed after 20 seconds", flush=True)
+                pass
         return sample
     
     async def _verify_single(self, sample: dict, mode: str, **kwargs) -> dict:
@@ -143,7 +149,6 @@ class VerifierPool:
     async def verify(self, sample: dict, **kwargs) -> dict:
         """Verify using the configured reward functions list."""
         fn_list = kwargs.get('reward_fns', self.reward_fns)
-        print(f"\033[38;5;196m\033[1m DEBUG: VerifierPool reward_fns: {fn_list}\033[0m", flush=True)
         tasks = [
             asyncio.create_task(
                 self._verify_single(deepcopy(sample), fn, **kwargs)
@@ -163,33 +168,4 @@ def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = 
     except Exception as e:
         return ray.get_actor("verifier_pool")
     
-if __name__ == '__main__':
-    import ray
-    from reward_registry import RewardType
-    from verifier_pool import get_or_create_verifier_pool
-
-    # Initialize Ray
-    ray.init(address="auto", namespace="test")
-
-    # Create a verifier pool with one worker
-    pool = get_or_create_verifier_pool(global_num_verifiers=1, write_failed=True, reward_fns=[RewardType.COUNTDOWN], output_dir=None)
-
-    # Define a sample for countdown task
-
-    with open("/workspace/home/lab/async-grpo/debug_samples_5e13be8310b0eb4b4d7149d09b4ed5dd.jsonl", "r") as f:
-        samples = [json.loads(line) for line in f]
-
-    # sample['sample_text'] = "<|im_start|>system\nYou are a helpful assistant. You first think about the reasoning process in your mind and then provide the user with the answer.<|im_end|>\n<|im_start|>user\nUsing the numbers [91, 65, 3], create an equation that equals 23. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think> We need to use the numbers 91, 65, and 3 only once to form an equation that equals 23. One way to approach this is to consider the operations and their effects on the numbers. The number 91 is quite large and 65 is also quite large, so subtracting or dividing might not be the best approach. The number 3 seems more manageable. A possible strategy is to think of a way to reduce the value of 91 and 65 to 23 using basic arithmetic. One way to do this is by combining them in a specific way after applying an operation to one of them. </think>\n<answer> (91 - 65) - 3 </answer><|im_end|>"
-    # sample['end_token'] = "<|im_end|>"
-
-    # Invoke the countdown reward adapter via the verifier pool
-    results = []
-    for s in samples:
-        results.append(ray.get(pool.verify.remote(s, reward_fns=[RewardType.TTRL_EXTRACT_ANSWER])))
-    
-
-    result2 = ray.get(pool.verify.remote(result, reward_fns=[RewardType.TTRL_REWARD]))
-
-    # print('Debugger result:', result)
-    from IPython import embed; embed()
     
