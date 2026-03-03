@@ -542,7 +542,10 @@ class Orchestrator:
 
         # Stage 7: Sync initial weights to all workers, including the now-ready RolloutWorkers.
         logger.info("Stage 7: Syncing initial weights to all workers...")
+        _sync_start = time.time()
         await self.sync_all_weights()
+        _sync_duration = time.time() - _sync_start
+        logger.info(f"[WEIGHT_SYNC_TIME_INIT] {_sync_duration:.4f} seconds")
         # Optionally verify sync (expensive); default is disabled
         if getattr(self.config, "verify_weight_sync_during_init", False):
             await self._verify_trainer_logprob_sync()
@@ -1188,7 +1191,10 @@ class Orchestrator:
                     # Ensure latest trainer weights are visible to generation/logprob workers
                     # so the next macro-batch and any evaluation use up-to-date parameters.
                     try:
+                        _sync_start = time.time()
                         await self.sync_all_weights()
+                        _sync_duration = time.time() - _sync_start
+                        logger.info(f"[WEIGHT_SYNC_TIME] {_sync_duration:.4f} seconds")
                     except Exception as _e:
                         logger.warning(f"Skipping weight sync after batch due to error: {_e}")
 
